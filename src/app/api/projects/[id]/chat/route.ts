@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import {
   getProject,
   getProjectDir,
@@ -7,15 +7,55 @@ import {
   touchProject,
   updateProjectName,
 } from "@/lib/projects";
-import { streamClaude, StreamEvent } from "@/lib/claude-stream";
+import { startClaude, isSessionActive, subscribe, StreamEvent } from "@/lib/claude-stream";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(
-  _request: Request,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const reconnect = request.nextUrl.searchParams.get("reconnect");
+
+  // Check for active session and stream events
+  if (reconnect === "1") {
+    if (!isSessionActive(id)) {
+      return NextResponse.json({ active: false });
+    }
+
+    const encoder = new TextEncoder();
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+
+    const unsubscribe = subscribe(id, async (event: StreamEvent) => {
+      try {
+        const data = JSON.stringify(event);
+        await writer.write(encoder.encode(`event: ${event.type}\ndata: ${data}\n\n`));
+        if (event.type === "done") {
+          await writer.close();
+        }
+      } catch {
+        // Connection closed
+      }
+    }, true); // replay buffered events
+
+    if (!unsubscribe) {
+      return NextResponse.json({ active: false });
+    }
+
+    return new Response(readable, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Content-Encoding": "none",
+      },
+    });
+  }
+
+  // Default: return chat history
   const messages = getChatHistory(id);
   return NextResponse.json(messages);
 }
@@ -50,44 +90,47 @@ export async function POST(
   const history = getChatHistory(id);
   const isFirstMessage = history.filter((m) => m.role === "user").length === 1;
 
-  const rawEvents = streamClaude(id, projectDir, userMessage, isFirstMessage);
-
   const encoder = new TextEncoder();
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
 
-  // Process events in the background
-  (async () => {
-    try {
-      for await (const event of rawEvents) {
-        // Handle title updates
-        if (event.type === "title") {
-          updateProjectName(id, event.content);
-        }
+  // Track text for incremental saving
+  let assistantText = "";
+  let savedAssistant = false;
 
-        const data = JSON.stringify(event);
-        await writer.write(encoder.encode(`event: ${event.type}\ndata: ${data}\n\n`));
-
-        if (event.type === "done") {
-          // Save assistant response
-          const cleanText = event.content.replace(/^TITLE:\s*.+\n*/m, "").trim();
-          if (cleanText) {
-            appendChatMessage(id, {
-              role: "assistant",
-              content: cleanText,
-              timestamp: new Date().toISOString(),
-            });
-          }
-          break;
-        }
-      }
-    } catch (err) {
-      const errorData = JSON.stringify({ type: "error", content: String(err) });
-      await writer.write(encoder.encode(`event: error\ndata: ${errorData}\n\n`));
-    } finally {
-      await writer.close();
+  // Start claude process with event callback
+  startClaude(id, projectDir, userMessage, isFirstMessage, (event: StreamEvent) => {
+    // Handle title updates
+    if (event.type === "title") {
+      updateProjectName(id, event.content);
     }
-  })();
+
+    // Track assistant text for saving
+    if (event.type === "text") {
+      assistantText += event.content;
+    }
+
+    // Save assistant message on done
+    if (event.type === "done" && !savedAssistant) {
+      savedAssistant = true;
+      const cleanText = assistantText.replace(/^TITLE:\s*.+\n*/m, "").trim();
+      if (cleanText) {
+        appendChatMessage(id, {
+          role: "assistant",
+          content: cleanText,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+
+    // Write SSE to the current connection
+    const data = JSON.stringify(event);
+    writer.write(encoder.encode(`event: ${event.type}\ndata: ${data}\n\n`)).catch(() => {});
+
+    if (event.type === "done") {
+      writer.close().catch(() => {});
+    }
+  });
 
   return new Response(readable, {
     headers: {

@@ -8,23 +8,63 @@ export interface StreamEvent {
   detail?: string;
 }
 
-const activeProcesses = new Map<string, ChildProcess>();
+type Subscriber = (event: StreamEvent) => void;
+
+interface ActiveSession {
+  process: ChildProcess;
+  eventBuffer: StreamEvent[];
+  subscribers: Set<Subscriber>;
+  fullText: string;
+  finished: boolean;
+}
+
+const activeSessions = new Map<string, ActiveSession>();
+
+export function isSessionActive(projectId: string): boolean {
+  const session = activeSessions.get(projectId);
+  return !!session && !session.finished;
+}
 
 export function killProcess(projectId: string): void {
-  const proc = activeProcesses.get(projectId);
-  if (proc) {
-    proc.kill("SIGTERM");
-    activeProcesses.delete(projectId);
+  const session = activeSessions.get(projectId);
+  if (session) {
+    session.process.kill("SIGTERM");
+    activeSessions.delete(projectId);
   }
 }
 
-export async function* streamClaude(
+export function subscribe(
+  projectId: string,
+  callback: Subscriber,
+  replay: boolean = true
+): (() => void) | null {
+  const session = activeSessions.get(projectId);
+  if (!session) return null;
+
+  // Replay buffered events
+  if (replay) {
+    for (const event of session.eventBuffer) {
+      callback(event);
+    }
+  }
+
+  // If already finished, no need to subscribe for future events
+  if (session.finished) return () => {};
+
+  session.subscribers.add(callback);
+  return () => {
+    session.subscribers.delete(callback);
+  };
+}
+
+export function startClaude(
   projectId: string,
   projectDir: string,
   prompt: string,
-  isFirstMessage: boolean
-): AsyncGenerator<StreamEvent> {
-  const fs = await import("fs");
+  isFirstMessage: boolean,
+  onEvent?: Subscriber
+): void {
+  const fs = require("fs") as typeof import("fs");
   fs.mkdirSync(projectDir, { recursive: true });
 
   const systemPrompt = isFirstMessage
@@ -56,21 +96,27 @@ export async function* streamClaude(
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  activeProcesses.set(projectId, claudeProcess);
+  const session: ActiveSession = {
+    process: claudeProcess,
+    eventBuffer: [],
+    subscribers: new Set(),
+    fullText: "",
+    finished: false,
+  };
 
-  // Event queue for async generator pattern
-  const eventQueue: StreamEvent[] = [];
-  let resolveWait: (() => void) | null = null;
-  let done = false;
+  if (onEvent) {
+    session.subscribers.add(onEvent);
+  }
+
+  activeSessions.set(projectId, session);
+
   let buffer = "";
-  let fullText = "";
   let seenTitle = false;
 
-  function enqueue(event: StreamEvent) {
-    eventQueue.push(event);
-    if (resolveWait) {
-      resolveWait();
-      resolveWait = null;
+  function emit(event: StreamEvent) {
+    session.eventBuffer.push(event);
+    for (const sub of session.subscribers) {
+      sub(event);
     }
   }
 
@@ -86,7 +132,6 @@ export async function* streamClaude(
 
     const type = data.type as string;
 
-    // Handle assistant messages (contains full content blocks)
     if (type === "assistant") {
       const message = data.message as Record<string, unknown> | undefined;
       if (message?.content) {
@@ -95,32 +140,30 @@ export async function* streamClaude(
           if (block.type === "text") {
             let text = block.text as string;
 
-            // Check for and extract title
             if (!seenTitle) {
               const titleMatch = text.match(/^TITLE:\s*(.+)$/m);
               if (titleMatch) {
                 seenTitle = true;
-                enqueue({ type: "title", content: titleMatch[1].trim() });
+                emit({ type: "title", content: titleMatch[1].trim() });
                 text = text.replace(/^TITLE:\s*.+\n*/m, "");
               }
             }
 
             if (text) {
-              fullText += text;
-              enqueue({ type: "text", content: text });
+              session.fullText += text;
+              emit({ type: "text", content: text });
             }
           } else if (block.type === "tool_use") {
             const toolName = block.name as string;
             const toolInput = block.input as Record<string, unknown> | undefined;
 
-            enqueue({ type: "activity", content: `Using ${toolName}...` });
+            emit({ type: "activity", content: `Using ${toolName}...` });
 
-            // Detect file changes from Write/Edit tool use
             if (toolName === "Write" || toolName === "Edit") {
               const filePath = (toolInput?.file_path || "") as string;
               if (filePath) {
                 const fileName = path.basename(filePath);
-                enqueue({ type: "file-change", content: fileName, detail: filePath });
+                emit({ type: "file-change", content: fileName, detail: filePath });
               }
             }
           }
@@ -129,29 +172,25 @@ export async function* streamClaude(
       return;
     }
 
-    // Handle result (final message)
     if (type === "result") {
       const resultText = data.result as string | undefined;
-      if (resultText && !fullText) {
-        // If we haven't seen any text yet, use the result
+      if (resultText && !session.fullText) {
         let text = resultText;
         if (!seenTitle) {
           const titleMatch = text.match(/^TITLE:\s*(.+)$/m);
           if (titleMatch) {
             seenTitle = true;
-            enqueue({ type: "title", content: titleMatch[1].trim() });
+            emit({ type: "title", content: titleMatch[1].trim() });
             text = text.replace(/^TITLE:\s*.+\n*/m, "");
           }
         }
         if (text) {
-          fullText = text;
-          enqueue({ type: "text", content: text });
+          session.fullText = text;
+          emit({ type: "text", content: text });
         }
       }
       return;
     }
-
-    // Skip system, rate_limit_event, etc.
   }
 
   claudeProcess.stdout!.on("data", (chunk: Buffer) => {
@@ -167,34 +206,20 @@ export async function* streamClaude(
   claudeProcess.stderr!.on("data", (chunk: Buffer) => {
     const text = chunk.toString();
     if (text.includes("Error") || text.includes("error")) {
-      enqueue({ type: "error", content: text.trim() });
+      emit({ type: "error", content: text.trim() });
     }
   });
 
   claudeProcess.on("close", (code) => {
-    // Process any remaining buffer
     if (buffer.trim()) {
       processJsonLine(buffer);
     }
 
-    done = true;
     if (code !== 0 && code !== null) {
-      enqueue({ type: "error", content: `Claude process exited with code ${code}` });
+      emit({ type: "error", content: `Claude process exited with code ${code}` });
     }
-    enqueue({ type: "done", content: fullText });
-    activeProcesses.delete(projectId);
+    emit({ type: "done", content: session.fullText });
+    session.finished = true;
+    session.subscribers.clear();
   });
-
-  // Yield events as they arrive
-  while (!done || eventQueue.length > 0) {
-    if (eventQueue.length > 0) {
-      const event = eventQueue.shift()!;
-      yield event;
-      if (event.type === "done") return;
-    } else if (!done) {
-      await new Promise<void>((resolve) => {
-        resolveWait = resolve;
-      });
-    }
-  }
 }
